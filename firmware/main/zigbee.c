@@ -96,6 +96,8 @@ zigbee_state_t zigbee_state = ZIGBEE_NOT_CONNECTED;
 uint8_t zigbee_ota_running = 0;
 uint8_t zigbee_sending = 0;
 
+const TickType_t zigbee_lock_timeout = pdMS_TO_TICKS(5000);
+
 /*==============================================================================
 Function Implementation
 ===============================================================================*/
@@ -107,7 +109,7 @@ void zigbee_start_pairing()
 void zigbee_config_report()
 {
     // uint32_t record_count = 0;
-    uint32_t reportable_change = 0;
+
     for (int i = 0; i < linky_label_list_size; i++)
     {
         if (linky_label_list[i].zb_access == 0)
@@ -119,6 +121,24 @@ void zigbee_config_report()
         {
             continue;
         }
+
+        esp_zb_zcl_reporting_info_t reporting_info = {
+            .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+            .ep = LINKY_TIC_ENDPOINT,
+            .cluster_id = linky_label_list[i].clusterID,
+            .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+            .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+            .u.send_info = {
+                .min_interval = 15,
+                .max_interval = 300,
+                .def_min_interval = 15,
+                .def_max_interval = 300,
+                // .delta =
+            },
+            .attr_id = linky_label_list[i].attributeID,
+            .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+
+        };
 
         if (linky_label_list[i].data == NULL)
         {
@@ -133,6 +153,7 @@ void zigbee_config_report()
             {
                 continue;
             }
+            reporting_info.u.send_info.delta.u8 = 1;
             break;
         }
         case UINT16:
@@ -141,6 +162,7 @@ void zigbee_config_report()
             {
                 continue;
             }
+            reporting_info.u.send_info.delta.u16 = 1;
             break;
         }
         case UINT32:
@@ -153,6 +175,7 @@ void zigbee_config_report()
             {
                 continue;
             }
+            reporting_info.u.send_info.delta.u32 = 1;
             break;
         }
         case UINT64:
@@ -165,6 +188,8 @@ void zigbee_config_report()
             {
                 continue;
             }
+            reporting_info.u.send_info.delta.u48.high = 0;
+            reporting_info.u.send_info.delta.u48.low = 1;
             break;
         }
         case STRING:
@@ -173,6 +198,8 @@ void zigbee_config_report()
             {
                 continue;
             }
+            continue;
+            //  reporting_info.u.send_info.delta.u8 = 1;
             break;
         }
         case UINT32_TIME:
@@ -181,31 +208,20 @@ void zigbee_config_report()
             {
                 continue;
             }
+            reporting_info.u.send_info.delta.u32 = 1;
             break;
         }
         default:
             break;
         };
-        esp_zb_zcl_config_report_record_t record;
-        record.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV;
-        record.attributeID = linky_label_list[i].attributeID;
-        record.attrType = linky_label_list[i].zb_type;
-        record.min_interval = 0;
-        record.max_interval = config_values.refresh_rate * 3;
-        record.reportable_change = &reportable_change;
 
-        esp_zb_zcl_config_report_cmd_t report_cmd = {
-            .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
-            .zcl_basic_cmd.src_endpoint = LINKY_TIC_ENDPOINT,
-            .clusterID = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-        };
-
-        // report_cmd.record_number = ARRAY_LENTH(records);
-        report_cmd.record_number = 1;
-        report_cmd.record_field = &record;
-
-        esp_zb_lock_acquire(portMAX_DELAY);
-        esp_zb_zcl_config_report_cmd_req(&report_cmd);
+        bool sucess = esp_zb_lock_acquire(zigbee_lock_timeout);
+        if (!sucess)
+        {
+            ESP_LOGE(TAG, "Failed to acquire lock");
+            return;
+        }
+        esp_zb_zcl_update_reporting_info(&reporting_info);
         esp_zb_lock_release();
         ESP_LOGI(TAG, "Send configure reporting for: %s", linky_label_list[i].label);
     }
@@ -747,7 +763,7 @@ static void zigbee_task(void *pvParameters)
     esp_zb_set_secondary_network_channel_set(0x07FFF800); // all channels
     ESP_ERROR_CHECK(esp_zb_start(false));
     ESP_LOGI(TAG, "Zigbee stack started");
-    esp_zb_main_loop_iteration();
+    esp_zb_stack_main_loop();
 }
 
 static esp_err_t zigbee_report_attribute(uint8_t endpoint, uint16_t clusterID, uint16_t attributeID, void *value, uint8_t value_length)
@@ -755,37 +771,43 @@ static esp_err_t zigbee_report_attribute(uint8_t endpoint, uint16_t clusterID, u
     esp_err_t ret = ESP_OK;
     // ESP_LOGW(TAG, "zigbee_report_attribute: 0x%x, attribute: 0x%x, value: %llu, length: %d", clusterID, attributeID, *(uint64_t *)value, value_length);
     esp_zb_zcl_report_attr_cmd_t cmd = {
-        .zcl_basic_cmd = {
-            .dst_addr_u = {
-                .addr_short = 0x0000,
-            },
-            .dst_endpoint = endpoint,
-            .src_endpoint = endpoint,
-        },
-        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_GROUP_ENDP_NOT_PRESENT,
         .clusterID = clusterID,
-        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         .attributeID = attributeID,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        .zcl_basic_cmd.src_endpoint = endpoint,
     };
+    bool success = esp_zb_lock_acquire(zigbee_lock_timeout);
+    if (!success)
+    {
+        ESP_LOGE(TAG, "Failed to acquire lock");
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_zb_zcl_attr_t *value_r = esp_zb_zcl_get_attribute(endpoint, clusterID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attributeID);
     if (value_r == NULL)
     {
         ESP_LOGE(TAG, "Attribute not found: 0x%x, attribute: 0x%x", clusterID, attributeID);
-        return ESP_ERR_NOT_FOUND;
+        ret = ESP_ERR_NOT_FOUND;
     }
     if (value == NULL)
     {
         ESP_LOGE(TAG, "Report value is NULL");
-        return ESP_ERR_INVALID_ARG;
+        ret = ESP_ERR_INVALID_ARG;
     }
+    if (ret != ESP_OK)
+    {
+        esp_zb_lock_release();
+        return ret;
+    }
+
     memcpy(value_r->data_p, value, value_length);
     ret = esp_zb_zcl_report_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
 
     return ret;
 }
-char string_buffer[100];
 
-uint64_t temp = 150;
 esp_err_t zigbee_send(linky_data_t *data)
 {
     esp_err_t ret = ESP_OK;
@@ -808,6 +830,9 @@ esp_err_t zigbee_send(linky_data_t *data)
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
     zigbee_sending = true;
+
+    static uint32_t seq = 0;
+    data->hist.PAPP = seq++;
 
     for (int i = 0; i < linky_label_list_size; i++)
     {
@@ -962,12 +987,20 @@ esp_err_t zigbee_send(linky_data_t *data)
         else
         {
             ESP_LOGI(TAG, "Set attribute cluster: Status: 0x%X 0x%x, attribute: 0x%x, name: %s, value: %lu", status, linky_label_list[i].clusterID, linky_label_list[i].attributeID, linky_label_list[i].label, *(uint32_t *)ptr_value);
+            bool success = esp_zb_lock_acquire(zigbee_lock_timeout);
+            if (!success)
+            {
+                ESP_LOGE(TAG, "Failed to acquire lock");
+                ret = ESP_ERR_TIMEOUT;
+                break;
+            }
             status = esp_zb_zcl_set_attribute_val(LINKY_TIC_ENDPOINT, linky_label_list[i].clusterID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, linky_label_list[i].attributeID, ptr_value, false);
             if (status != ESP_ZB_ZCL_STATUS_SUCCESS)
             {
                 ESP_LOGE(TAG, "Set attribute failed: 0x%x", status);
                 ret = ESP_FAIL;
             }
+            esp_zb_lock_release();
         }
         if (zigbee_ota_running)
         {
